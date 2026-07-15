@@ -2,7 +2,7 @@
 /**
  * Plugin Name: VRU Sakaeo Facebook News Importer
  * Description: Import selected Facebook Page posts and images into WordPress news posts for VRU Sakaeo.
- * Version: 2.1.0
+ * Version: 2.2.0
  * Author: VRU Sakaeo
  * Requires at least: 6.0
  * Requires PHP: 7.4
@@ -146,7 +146,9 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 		if ( $is_monthly_import ) {
 			$month   = isset( $_POST['facebook_month'] ) ? sanitize_text_field( wp_unslash( $_POST['facebook_month'] ) ) : '';
 			$raw_ids = isset( $_POST['facebook_post_ids'] ) && is_array( $_POST['facebook_post_ids'] ) ? wp_unslash( $_POST['facebook_post_ids'] ) : array();
+			$raw_categories = isset( $_POST['facebook_post_categories'] ) && is_array( $_POST['facebook_post_categories'] ) ? wp_unslash( $_POST['facebook_post_categories'] ) : array();
 			$ids     = array();
+			$post_categories = array();
 
 			foreach ( $raw_ids as $raw_id ) {
 				$id = sanitize_text_field( (string) $raw_id );
@@ -155,7 +157,15 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 				}
 			}
 
-			$results = $this->import_selected_month_posts( $month, array_values( array_unique( $ids ) ) );
+			foreach ( $raw_categories as $raw_post_id => $raw_category_id ) {
+				$post_id     = sanitize_text_field( (string) $raw_post_id );
+				$category_id = absint( $raw_category_id );
+				if ( '' !== $post_id && $this->is_valid_category_id( $category_id ) ) {
+					$post_categories[ $post_id ] = $category_id;
+				}
+			}
+
+			$results = $this->import_selected_month_posts( $month, array_values( array_unique( $ids ) ), $post_categories );
 			set_transient( 'vru_sakaeo_fb_news_last_results_' . get_current_user_id(), $results, 5 * MINUTE_IN_SECONDS );
 
 			wp_safe_redirect(
@@ -174,6 +184,10 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 
 		$raw_urls = isset( $_POST['facebook_urls'] ) ? sanitize_textarea_field( wp_unslash( $_POST['facebook_urls'] ) ) : '';
 		$urls     = $this->split_urls( $raw_urls );
+		$category_id = isset( $_POST['facebook_category_id'] ) ? absint( wp_unslash( $_POST['facebook_category_id'] ) ) : 0;
+		if ( ! $this->is_valid_category_id( $category_id ) ) {
+			$category_id = 0;
+		}
 		$results  = array();
 
 		if ( count( $urls ) > self::MAX_IMPORT_URLS ) {
@@ -185,7 +199,7 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 			$results[] = $this->result( '', 'error', 'กรุณาวางลิงก์โพสต์ Facebook อย่างน้อย 1 ลิงก์' );
 		} else {
 			foreach ( $urls as $url ) {
-				$results[] = $this->import_from_url( $url );
+				$results[] = $this->import_from_url( $url, $category_id );
 			}
 		}
 
@@ -257,6 +271,8 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 	}
 
 	private function render_link_import_tab(): void {
+		$settings   = $this->get_settings();
+		$categories = get_categories( array( 'hide_empty' => false ) );
 		?>
 		<p>วางลิงก์โพสต์จากเพจ Facebook ทีละหลายบรรทัด ระบบจะสร้างข่าว WordPress และเผยแพร่ทันที</p>
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin.php' ) ); ?>">
@@ -270,6 +286,19 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 						<p class="description">ใส่ 1 ลิงก์ต่อ 1 บรรทัด หากเป็นลิงก์แบบ pfbid แล้วจับคู่ไม่ได้ ให้ใช้แท็บเลือกจากโพสต์รายเดือน</p>
 					</td>
 				</tr>
+				<tr>
+					<th scope="row"><label for="facebook_category_id">หมวดหมู่ข่าวสำหรับรอบนี้</label></th>
+					<td>
+						<select id="facebook_category_id" name="facebook_category_id">
+							<?php foreach ( $categories as $category ) : ?>
+								<option value="<?php echo esc_attr( $category->term_id ); ?>" <?php selected( $settings['category_id'], $category->term_id ); ?>>
+									<?php echo esc_html( $category->name ); ?>
+								</option>
+							<?php endforeach; ?>
+						</select>
+						<p class="description">ใช้เฉพาะการนำเข้ารอบนี้ ไม่เปลี่ยนหมวดหมู่ข่าวเริ่มต้นในหน้าตั้งค่า</p>
+					</td>
+				</tr>
 			</table>
 			<?php submit_button( 'นำเข้าและเผยแพร่', 'primary', 'vru_sakaeo_fb_news_import_submit' ); ?>
 		</form>
@@ -277,6 +306,8 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 	}
 
 	private function render_monthly_import_tab(): void {
+		$settings   = $this->get_settings();
+		$categories = get_categories( array( 'hide_empty' => false ) );
 		$month = isset( $_GET['facebook_month'] ) ? sanitize_text_field( wp_unslash( $_GET['facebook_month'] ) ) : current_time( 'Y-m' );
 		if ( ! preg_match( '/^\d{4}-\d{2}$/', $month ) ) {
 			$month = current_time( 'Y-m' );
@@ -317,7 +348,7 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 				<input type="hidden" name="page" value="vru-sakaeo-fb-news-importer" />
 				<input type="hidden" name="facebook_month" value="<?php echo esc_attr( $month ); ?>" />
 				<?php wp_nonce_field( self::NONCE_ACTION, 'vru_sakaeo_fb_news_nonce' ); ?>
-				<?php $this->render_monthly_posts_table( $posts ); ?>
+				<?php $this->render_monthly_posts_table( $posts, $categories, (int) $settings['category_id'] ); ?>
 				<?php submit_button( 'นำเข้าและเผยแพร่โพสต์ที่เลือก', 'primary', 'vru_sakaeo_fb_news_monthly_import_submit' ); ?>
 			</form>
 		<?php elseif ( ! empty( $_GET['vru_fb_fetch_month'] ) && '' === $error ) : ?>
@@ -326,14 +357,24 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 		<?php
 	}
 
-	private function render_monthly_posts_table( array $posts ): void {
+	private function render_monthly_posts_table( array $posts, array $categories, int $default_category_id ): void {
 		?>
+		<div style="margin: 12px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+			<label for="vru-fb-bulk-category"><strong>ตั้งหมวดหมู่ทุกโพสต์</strong></label>
+			<select id="vru-fb-bulk-category">
+				<?php foreach ( $categories as $category ) : ?>
+					<option value="<?php echo esc_attr( $category->term_id ); ?>" <?php selected( $default_category_id, $category->term_id ); ?>><?php echo esc_html( $category->name ); ?></option>
+				<?php endforeach; ?>
+			</select>
+			<button type="button" class="button" onclick="var value=document.getElementById('vru-fb-bulk-category').value; document.querySelectorAll('.vru-fb-category-select').forEach(function(el){el.value=value;});">ใช้กับทุกรายการ</button>
+		</div>
 		<table class="widefat striped">
 			<thead>
 				<tr>
 					<td class="manage-column column-cb check-column"><input type="checkbox" onclick="var checked=this.checked; document.querySelectorAll('.vru-fb-post-check').forEach(function(el){el.checked = checked;});" /></td>
 					<th>วันที่โพสต์</th>
 					<th>ตัวอย่างข้อความ</th>
+					<th>หมวดหมู่ข่าว</th>
 					<th>รูป</th>
 					<th>สถานะ</th>
 					<th>ลิงก์</th>
@@ -357,6 +398,17 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 						</th>
 						<td><?php echo esc_html( $this->format_facebook_created_time( $post ) ); ?></td>
 						<td><?php echo esc_html( '' !== $preview ? $preview : '(ไม่มีข้อความ)' ); ?></td>
+						<td>
+							<?php if ( ! $existing_id && $post_id ) : ?>
+								<select class="vru-fb-category-select" name="facebook_post_categories[<?php echo esc_attr( $post_id ); ?>]">
+									<?php foreach ( $categories as $category ) : ?>
+										<option value="<?php echo esc_attr( $category->term_id ); ?>" <?php selected( $default_category_id, $category->term_id ); ?>><?php echo esc_html( $category->name ); ?></option>
+									<?php endforeach; ?>
+								</select>
+							<?php else : ?>
+								-
+							<?php endif; ?>
+						</td>
 						<td><?php echo esc_html( (string) $image_count ); ?></td>
 						<td>
 							<?php if ( $existing_id ) : ?>
@@ -409,7 +461,7 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 						<td><?php echo '' !== $this->get_app_secret() ? '<span style="color:#008a20;">configured</span>' : '<span style="color:#b32d2e;">missing</span>'; ?></td>
 					</tr>
 					<tr>
-						<td><code>VRU_FB_APP_ID</code> <span class="description">(optional)</span></td>
+						<td><code>VRU_FB_APP_ID</code> <span class="description">(optional, ไม่จำเป็นสำหรับการตรวจการเชื่อมต่อ v2.2)</span></td>
 						<td><?php echo '' !== $this->get_app_id() ? '<span style="color:#008a20;">configured</span>' : '<span style="color:#666;">missing</span>'; ?></td>
 					</tr>
 				</tbody>
@@ -585,105 +637,85 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 	}
 
 	private function render_token_diagnostics(): void {
-		if ( ! $this->has_page_access_token() || '' === $this->get_app_secret() || '' === $this->get_app_id() ) {
-			echo '<p class="description">ตั้งค่า <code>VRU_FB_APP_ID</code> เพิ่ม หากต้องการให้ปลั๊กอินตรวจสถานะ token แบบไม่แสดง token</p>';
+		if ( ! $this->has_page_access_token() || '' === $this->get_required_page_id() || '' === $this->get_app_secret() ) {
+			echo '<p class="description">ตั้งค่า Page ID, access token และ App Secret ให้ครบ เพื่อทดสอบการเชื่อมต่อกับเพจ</p>';
 			return;
 		}
 
-		$debug = $this->fetch_token_debug_info();
-		if ( is_wp_error( $debug ) ) {
-			echo '<div class="notice notice-warning inline"><p>ตรวจสถานะ token ไม่สำเร็จ: ' . esc_html( $debug->get_error_message() ) . '</p></div>';
+		$diagnostics = $this->fetch_operational_page_diagnostics();
+		if ( is_wp_error( $diagnostics ) ) {
+			echo '<div class="notice notice-warning inline"><p>ตรวจการเชื่อมต่อ Facebook Page ไม่สำเร็จ: ' . esc_html( $diagnostics->get_error_message() ) . '</p></div>';
 			return;
 		}
 
-		$data       = isset( $debug['data'] ) && is_array( $debug['data'] ) ? $debug['data'] : array();
-		$is_valid   = ! empty( $data['is_valid'] );
-		$app_id     = isset( $data['app_id'] ) ? sanitize_text_field( (string) $data['app_id'] ) : '';
-		$token_type = isset( $data['type'] ) ? sanitize_text_field( (string) $data['type'] ) : '';
-		$expires_at = ! empty( $data['expires_at'] ) ? date_i18n( 'Y-m-d H:i:s', (int) $data['expires_at'] ) : 'ไม่ระบุ';
-		$scopes     = ! empty( $data['scopes'] ) && is_array( $data['scopes'] ) ? implode( ', ', array_map( 'sanitize_text_field', $data['scopes'] ) ) : 'ไม่ระบุ';
-		$page_token_status = 'not checked';
-		$page_token_detail = '';
-		if ( $is_valid && 'PAGE' === strtoupper( $token_type ) ) {
-			$page_token_status = 'direct Page token';
-		} elseif ( $is_valid ) {
-			$derived_token = $this->fetch_page_access_token_from_source_token( $this->get_source_access_token() );
-			if ( is_wp_error( $derived_token ) ) {
-				$page_token_status = 'unavailable';
-				$page_token_detail = $derived_token->get_error_message();
-			} else {
-				$page_token_status = 'available';
-			}
-		}
+		$page_id    = isset( $diagnostics['id'] ) ? sanitize_text_field( (string) $diagnostics['id'] ) : '';
+		$page_name  = isset( $diagnostics['name'] ) ? sanitize_text_field( (string) $diagnostics['name'] ) : '';
+		$token_mode = isset( $diagnostics['token_mode'] ) ? sanitize_text_field( (string) $diagnostics['token_mode'] ) : '';
 		?>
 		<table class="widefat striped" style="max-width: 900px; margin: 16px 0;">
 			<thead>
-				<tr><th colspan="2">Token diagnostics</th></tr>
+				<tr><th colspan="2">สถานะการเชื่อมต่อ Facebook Page</th></tr>
 			</thead>
 			<tbody>
 				<tr>
-					<td>สถานะ</td>
-					<td><?php echo $is_valid ? '<span style="color:#008a20;">valid</span>' : '<span style="color:#b32d2e;">invalid</span>'; ?></td>
+					<td>การเชื่อมต่อ</td>
+					<td><span style="color:#008a20;">พร้อมใช้งาน</span></td>
 				</tr>
 				<tr>
-					<td>App ID</td>
-					<td><?php echo esc_html( $app_id ? $app_id : 'ไม่ระบุ' ); ?></td>
+					<td>เพจ</td>
+					<td><?php echo esc_html( $page_name ? $page_name : 'ไม่ระบุ' ); ?></td>
 				</tr>
 				<tr>
-					<td>Token type</td>
-					<td><?php echo esc_html( $token_type ? $token_type : 'ไม่ระบุ' ); ?></td>
+					<td>Page ID</td>
+					<td><?php echo esc_html( $page_id ); ?></td>
 				</tr>
 				<tr>
-					<td>หมดอายุ</td>
-					<td><?php echo esc_html( $expires_at ); ?></td>
+					<td>Page access token</td>
+					<td><?php echo esc_html( $token_mode ); ?></td>
 				</tr>
 				<tr>
-					<td>Scopes</td>
-					<td><?php echo esc_html( $scopes ); ?></td>
-				</tr>
-				<tr>
-					<td>Page token derivation</td>
-					<td>
-						<?php echo esc_html( $page_token_status ); ?>
-						<?php if ( $page_token_detail ) : ?>
-							<br><span class="description"><?php echo esc_html( $page_token_detail ); ?></span>
-						<?php endif; ?>
-					</td>
+					<td>App Secret Proof</td>
+					<td><span style="color:#008a20;">ผ่านการตรวจสอบ</span></td>
 				</tr>
 			</tbody>
 		</table>
 		<?php
 	}
 
-	private function fetch_token_debug_info() {
-		$response = wp_safe_remote_post(
-			sprintf( 'https://graph.facebook.com/%s/debug_token', self::GRAPH_VERSION ),
+	private function fetch_operational_page_diagnostics() {
+		$access_token = $this->get_runtime_page_access_token();
+		if ( is_wp_error( $access_token ) ) {
+			return $access_token;
+		}
+
+		$page_id  = $this->get_required_page_id();
+		$endpoint = sprintf( 'https://graph.facebook.com/%s/%s', self::GRAPH_VERSION, rawurlencode( $page_id ) );
+		$url      = add_query_arg(
 			array(
-				'timeout'            => 20,
-				'redirection'        => 0,
-				'reject_unsafe_urls' => true,
-				'headers'            => array(
-					'Authorization' => 'Bearer ' . $this->get_app_id() . '|' . $this->get_app_secret(),
-					'Accept'        => 'application/json',
-				),
-				'body'               => array(
-					'input_token' => $this->get_source_access_token(),
-				),
-			)
+				'fields'          => 'id,name',
+				'appsecret_proof' => $this->build_appsecret_proof( $access_token ),
+			),
+			$endpoint
 		);
 
-		if ( is_wp_error( $response ) ) {
-			return new WP_Error( 'vru_fb_debug_http_error', $this->redact_sensitive_text( $response->get_error_message() ) );
+		$body = $this->fetch_facebook_json_object( $url, $access_token );
+		if ( is_wp_error( $body ) ) {
+			return $body;
 		}
 
-		$code = wp_remote_retrieve_response_code( $response );
-		$body = json_decode( wp_remote_retrieve_body( $response ), true );
-
-		if ( $code < 200 || $code >= 300 || ! is_array( $body ) ) {
-			return new WP_Error( 'vru_fb_debug_api_error', 'Meta ไม่สามารถตรวจ token ได้ กรุณาตรวจ App ID, App Secret และ token' );
+		$actual_page_id = isset( $body['id'] ) ? sanitize_text_field( (string) $body['id'] ) : '';
+		if ( '' === $actual_page_id || ! hash_equals( $page_id, $actual_page_id ) ) {
+			return new WP_Error( 'vru_fb_diagnostics_page_mismatch', 'Page ID ที่ตอบกลับไม่ตรงกับ VRU_FB_PAGE_ID' );
 		}
 
-		return $body;
+		$source_token = $this->get_source_access_token();
+		$token_mode   = hash_equals( $source_token, $access_token ) ? 'ใช้ Page token ที่ตั้งค่าโดยตรง' : 'แปลงจาก System User token สำเร็จ';
+
+		return array(
+			'id'         => $actual_page_id,
+			'name'       => isset( $body['name'] ) ? sanitize_text_field( (string) $body['name'] ) : '',
+			'token_mode' => $token_mode,
+		);
 	}
 
 	private function missing_secret_labels(): array {
@@ -709,8 +741,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 		return '' !== $expected_page_id && '' !== $actual_page_id && hash_equals( $expected_page_id, $actual_page_id );
 	}
 
-	private function import_from_url( string $url ): array {
-		$settings = $this->get_settings();
+	private function import_from_url( string $url, int $category_id = 0 ): array {
 		$url      = esc_url_raw( trim( $url ) );
 
 		$missing = $this->missing_secret_labels();
@@ -765,11 +796,12 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 			);
 		}
 
-		return $this->import_facebook_post( $facebook_post, $url );
+		return $this->import_facebook_post( $facebook_post, $url, $category_id );
 	}
 
-	private function import_facebook_post( array $facebook_post, string $source_url = '' ): array {
+	private function import_facebook_post( array $facebook_post, string $source_url = '', int $category_id = 0 ): array {
 		$settings = $this->get_settings();
+		$post_category_id = $this->resolve_category_id( $category_id, (int) $settings['category_id'] );
 
 		if ( ! $this->facebook_post_matches_configured_page( $facebook_post ) ) {
 			return $this->log_result( $this->result( $source_url, 'error', 'โพสต์นี้ไม่ได้มาจาก Page ID ที่อนุญาตไว้ จึงไม่สร้างข่าว' ) );
@@ -806,7 +838,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 				'post_content'  => $content,
 				'post_status'   => 'publish',
 				'post_author'   => (int) $settings['author_id'],
-				'post_category' => array_filter( array( (int) $settings['category_id'] ) ),
+				'post_category' => array_filter( array( $post_category_id ) ),
 				'post_date'     => $this->facebook_date_for_wordpress( $facebook_post ),
 				'meta_input'    => array(
 					'_vru_fb_post_id'     => $facebook_post_id,
@@ -838,7 +870,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 		return $this->log_result( $this->result( $source_url ? $source_url : $permalink, 'success', $message_text, $new_post_id, $title ) );
 	}
 
-	private function import_selected_month_posts( string $month, array $selected_ids ): array {
+	private function import_selected_month_posts( string $month, array $selected_ids, array $post_categories = array() ): array {
 		if ( empty( $selected_ids ) ) {
 			return array( $this->result( '', 'error', 'กรุณาเลือกโพสต์ที่ต้องการนำเข้าอย่างน้อย 1 รายการ' ) );
 		}
@@ -867,10 +899,33 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 			}
 
 			$source_url = ! empty( $post_map[ $selected_id ]['permalink_url'] ) ? esc_url_raw( (string) $post_map[ $selected_id ]['permalink_url'] ) : '';
-			$results[]  = $this->import_facebook_post( $post_map[ $selected_id ], $source_url );
+			$category_id = isset( $post_categories[ $selected_id ] ) ? absint( $post_categories[ $selected_id ] ) : 0;
+			$results[]  = $this->import_facebook_post( $post_map[ $selected_id ], $source_url, $category_id );
 		}
 
 		return $results;
+	}
+
+	private function is_valid_category_id( int $category_id ): bool {
+		if ( $category_id <= 0 ) {
+			return false;
+		}
+
+		$term = get_term( $category_id, 'category' );
+		return $term instanceof WP_Term && ! is_wp_error( $term );
+	}
+
+	private function resolve_category_id( int $category_id, int $default_category_id ): int {
+		if ( $this->is_valid_category_id( $category_id ) ) {
+			return $category_id;
+		}
+
+		if ( $this->is_valid_category_id( $default_category_id ) ) {
+			return $default_category_id;
+		}
+
+		$wordpress_default = absint( get_option( 'default_category', 0 ) );
+		return $this->is_valid_category_id( $wordpress_default ) ? $wordpress_default : 0;
 	}
 
 	private function fetch_facebook_posts_by_month( string $month ) {

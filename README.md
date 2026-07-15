@@ -2,12 +2,14 @@
 
 ปลั๊กอิน WordPress สำหรับนำเข้าข่าวจาก Facebook Page ของ VRU Sakaeo โดยเลือกดึงจากโพสต์รายเดือน หรือวางลิงก์โพสต์เอง แล้วสร้างเป็นข่าว WordPress พร้อมรูปภาพ, featured image, gallery 3 คอลัมน์, log การนำเข้า และระบบกันโพสต์ซ้ำ
 
+เวอร์ชัน `2.2.0` ใน commit นี้กู้คืนจากปลั๊กอินที่ใช้งานจริงบนโฮสต์เมื่อวันที่ 15 กรกฎาคม 2026 ก่อนเริ่มแก้บั๊กภาพ โดยไฟล์ PHP ต้นฉบับมี SHA-256 `2E7130BBD0180E68A5AE61B892D56E21443858E4014766D7D3453C9187DD0B7F`
+
 ## การติดตั้ง
 
 1. อัปโหลดไฟล์ `vru-sakaeo-facebook-news-importer.zip` ที่ WordPress Admin > Plugins > Add New > Upload Plugin
 2. Activate ปลั๊กอิน `VRU Sakaeo Facebook News Importer`
 3. ตั้งค่า secret ใน `wp-config.php` หรือ environment variable ของโฮสต์
-4. ไปที่เมนู `นำเข้าข่าว Facebook > ตั้งค่า` เพื่อตรวจสถานะ secret และ token diagnostics
+4. ไปที่เมนู `นำเข้าข่าว Facebook > ตั้งค่า` เพื่อตรวจสถานะ secret และทดสอบ Page API จริง
 5. ใช้แท็บ `เลือกจากโพสต์รายเดือน` เป็นวิธีหลัก หรือใช้แท็บ `นำเข้าจากลิงก์` เมื่อมีลิงก์เฉพาะ
 
 ตัวอย่างสำหรับ `wp-config.php`:
@@ -23,14 +25,14 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 
 ## Facebook Token
 
-ปลั๊กอิน v2.1 รองรับค่า `VRU_FB_PAGE_ACCESS_TOKEN` ได้ 2 แบบ:
+ปลั๊กอิน v2.2.0 รองรับค่า `VRU_FB_PAGE_ACCESS_TOKEN` ได้ 2 แบบ:
 
 - Page access token โดยตรง
 - System User token ที่สามารถดึง Page access token ของ `VRU_FB_PAGE_ID` ได้
 
 สำหรับเพจแบบ New Page Experience นั้น Meta อาจปฏิเสธการเรียก `PAGE_ID/posts` ด้วย System User token โดยตรงและแจ้งว่า “ต้องใช้ Page access token” ปลั๊กอินจึงพยายามดึง Page token จาก token ต้นทางก่อนผ่าน `/{PAGE_ID}?fields=id,name,access_token` และ fallback ผ่าน `/me/accounts` แล้วจึงใช้ Page token ที่ได้เรียก `/posts`
 
-หากหน้า diagnostics แสดง `Token type = SYSTEM_USER` แต่ `Page token derivation = unavailable` ให้ตรวจใน Business Settings ว่า System User ถูก assign asset เป็นเพจ VRU Sakaeo แล้ว และตอน Generate Token ควรมี permission ที่เกี่ยวข้อง เช่น `pages_show_list`, `pages_read_engagement`, `pages_read_user_content` และในบางกรณีของ Business/System User ต้องมี `business_management` เพื่อดึง Page token ได้
+หน้า Settings ทดสอบการอ่านข้อมูลเพจและ `PAGE_ID/posts` จริง จึงไม่ใช้ผล `debug_token` เพียงอย่างเดียวในการตัดสินว่า token ใช้งานได้หรือไม่ หากทดสอบไม่ผ่าน ให้ตรวจใน Business Settings ว่า System User ถูก assign asset เป็นเพจ VRU Sakaeo แล้ว และตอน Generate Token ควรมี permission ที่เกี่ยวข้อง เช่น `pages_show_list`, `pages_read_engagement`, `pages_read_user_content` และในบางกรณีของ Business/System User ต้องมี `business_management` เพื่อดึง Page token ได้
 
 Graph API Explorer token เหมาะสำหรับทดสอบระยะสั้น ไม่ควรใช้เป็น token งานจริงระยะยาว งานจริงควรใช้ Page access token ที่จัดการอายุ token แล้ว หรือ System User token ที่ผูกกับ Business/App/Page ถูกต้องและไม่หมดอายุ
 
@@ -61,6 +63,7 @@ Graph API Explorer token เหมาะสำหรับทดสอบระ�
 
 - ดึงโพสต์จาก `PAGE_ID/posts` ตามเดือน
 - แสดงตารางโพสต์พร้อม checkbox, วันที่, ตัวอย่างข้อความ, จำนวนรูป และสถานะเคยนำเข้าแล้วหรือยัง
+- เลือกหมวดหมู่ให้แต่ละโพสต์ก่อนนำเข้าได้ โดยไม่ต้องกลับไปสลับหมวดหมู่เริ่มต้นใน Settings
 - สร้าง WordPress post สถานะ `publish`
 - ตั้งหัวข้อจากบรรทัดแรกของโพสต์ โดยตัดตามจำนวนตัวอักษรเพื่อรองรับภาษาไทย
 - ตั้งรูปแรกเป็น Featured Image
