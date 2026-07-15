@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: VRU Sakaeo Facebook News Importer
- * Description: Import selected Facebook Page posts and images into WordPress news posts for VRU Sakaeo.
- * Version: 2.2.0
+ * Description: Production image hotfix for importing selected VRU Sakaeo Facebook Page posts into WordPress news.
+ * Version: 2.2.1
  * Author: VRU Sakaeo
  * Requires at least: 6.0
  * Requires PHP: 7.4
@@ -14,21 +14,23 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 final class VRU_Sakaeo_Facebook_News_Importer {
-	private const OPTION_SETTINGS = 'vru_sakaeo_fb_news_settings';
-	private const OPTION_LOGS     = 'vru_sakaeo_fb_news_logs';
-	private const NONCE_ACTION    = 'vru_sakaeo_fb_news_import';
-	private const CAPABILITY      = 'vru_import_facebook_news';
-	private const GRAPH_VERSION   = 'v25.0';
-	private const MAX_LOGS        = 100;
-	private const MAX_IMPORT_URLS = 20;
-	private const MAX_IMAGE_BYTES = 10485760;
+	private const OPTION_SETTINGS            = 'vru_sakaeo_fb_news_settings';
+	private const OPTION_LOGS                = 'vru_sakaeo_fb_news_logs';
+	private const NONCE_ACTION               = 'vru_sakaeo_fb_news_import';
+	private const REPAIR_NONCE_ACTION        = 'vru_sakaeo_fb_news_repair';
+	private const CAPABILITY                 = 'vru_import_facebook_news';
+	private const GRAPH_VERSION              = 'v25.0';
+	private const MAX_LOGS                   = 100;
+	private const MAX_IMPORT_URLS            = 20;
+	private const MAX_IMAGE_BYTES            = 10485760;
 	private const PAGE_POST_SEARCH_PAGE_SIZE = 25;
 	private const PAGE_POST_SEARCH_PAGES     = 8;
 	private const MONTHLY_POST_PAGE_SIZE     = 100;
 	private const MONTHLY_POST_MAX_PAGES     = 12;
 	private const MAX_MONTHLY_IMPORT_POSTS   = 50;
 	private const TITLE_MAX_CHARS            = 150;
-	private const FACEBOOK_POST_FIELDS       = 'id,from{id,name},message,created_time,permalink_url,full_picture,attachments{media,subattachments,target,type,url,title,description}';
+	private const FACEBOOK_POST_FIELDS       = 'id,from{id,name},message,created_time,permalink_url,full_picture,attachments{media,target{id},type,url,title,description,subattachments{media,target{id},type,url,title,description}}';
+	private const ALLOWED_GALLERY_SIZES      = array( 'medium_large', 'large', 'full' );
 
 	private const FACEBOOK_HOST_SUFFIXES = array(
 		'facebook.com',
@@ -40,7 +42,7 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 		'fbsbx.com',
 	);
 
-	private array $last_results = array();
+	private array $last_results               = array();
 	private string $runtime_page_access_token = '';
 
 	public function __construct() {
@@ -50,6 +52,7 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 		add_action( 'admin_init', array( $this, 'register_settings' ) );
 		add_action( 'admin_init', array( $this, 'handle_import_request' ) );
 		add_action( 'admin_notices', array( $this, 'render_admin_notices' ) );
+		add_action( 'wp_ajax_vru_fb_repair_post', array( $this, 'handle_repair_ajax' ) );
 		add_filter( 'option_page_capability_vru_sakaeo_fb_news_settings_group', array( $this, 'settings_capability' ) );
 	}
 
@@ -97,6 +100,15 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 
 		add_submenu_page(
 			'vru-sakaeo-fb-news-importer',
+			'ซ่อมรูปข่าวเดิม',
+			'ซ่อมรูปข่าวเดิม',
+			self::CAPABILITY,
+			'vru-sakaeo-fb-news-repair',
+			array( $this, 'render_repair_page' )
+		);
+
+		add_submenu_page(
+			'vru-sakaeo-fb-news-importer',
 			'ตั้งค่าการนำเข้า',
 			'ตั้งค่า',
 			self::CAPABILITY,
@@ -121,11 +133,18 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 		$defaults = $this->default_settings();
 		$settings = is_array( $settings ) ? $settings : array();
 
+		$gallery_size = isset( $settings['gallery_size'] ) ? sanitize_key( (string) $settings['gallery_size'] ) : $defaults['gallery_size'];
+		if ( ! in_array( $gallery_size, self::ALLOWED_GALLERY_SIZES, true ) ) {
+			$gallery_size = $defaults['gallery_size'];
+		}
+
 		return array(
-			'category_id'  => isset( $settings['category_id'] ) ? absint( $settings['category_id'] ) : $defaults['category_id'],
-			'author_id'    => isset( $settings['author_id'] ) ? absint( $settings['author_id'] ) : $defaults['author_id'],
-			'max_images'   => isset( $settings['max_images'] ) ? max( 1, min( 10, absint( $settings['max_images'] ) ) ) : $defaults['max_images'],
-			'show_source'  => ! empty( $settings['show_source'] ) ? 1 : 0,
+			'category_id'                 => isset( $settings['category_id'] ) ? absint( $settings['category_id'] ) : $defaults['category_id'],
+			'author_id'                   => isset( $settings['author_id'] ) ? absint( $settings['author_id'] ) : $defaults['author_id'],
+			'max_images'                  => isset( $settings['max_images'] ) ? max( 1, min( 10, absint( $settings['max_images'] ) ) ) : $defaults['max_images'],
+			'gallery_size'                => $gallery_size,
+			'include_featured_in_gallery' => ! empty( $settings['include_featured_in_gallery'] ) ? 1 : 0,
+			'show_source'                 => ! empty( $settings['show_source'] ) ? 1 : 0,
 		);
 	}
 
@@ -144,10 +163,10 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 		check_admin_referer( self::NONCE_ACTION, 'vru_sakaeo_fb_news_nonce' );
 
 		if ( $is_monthly_import ) {
-			$month   = isset( $_POST['facebook_month'] ) ? sanitize_text_field( wp_unslash( $_POST['facebook_month'] ) ) : '';
-			$raw_ids = isset( $_POST['facebook_post_ids'] ) && is_array( $_POST['facebook_post_ids'] ) ? wp_unslash( $_POST['facebook_post_ids'] ) : array();
-			$raw_categories = isset( $_POST['facebook_post_categories'] ) && is_array( $_POST['facebook_post_categories'] ) ? wp_unslash( $_POST['facebook_post_categories'] ) : array();
-			$ids     = array();
+			$month           = isset( $_POST['facebook_month'] ) ? sanitize_text_field( wp_unslash( $_POST['facebook_month'] ) ) : '';
+			$raw_ids         = isset( $_POST['facebook_post_ids'] ) && is_array( $_POST['facebook_post_ids'] ) ? wp_unslash( $_POST['facebook_post_ids'] ) : array();
+			$raw_categories  = isset( $_POST['facebook_post_categories'] ) && is_array( $_POST['facebook_post_categories'] ) ? wp_unslash( $_POST['facebook_post_categories'] ) : array();
+			$ids             = array();
 			$post_categories = array();
 
 			foreach ( $raw_ids as $raw_id ) {
@@ -182,13 +201,13 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 			exit;
 		}
 
-		$raw_urls = isset( $_POST['facebook_urls'] ) ? sanitize_textarea_field( wp_unslash( $_POST['facebook_urls'] ) ) : '';
-		$urls     = $this->split_urls( $raw_urls );
+		$raw_urls    = isset( $_POST['facebook_urls'] ) ? sanitize_textarea_field( wp_unslash( $_POST['facebook_urls'] ) ) : '';
+		$urls        = $this->split_urls( $raw_urls );
 		$category_id = isset( $_POST['facebook_category_id'] ) ? absint( wp_unslash( $_POST['facebook_category_id'] ) ) : 0;
 		if ( ! $this->is_valid_category_id( $category_id ) ) {
 			$category_id = 0;
 		}
-		$results  = array();
+		$results = array();
 
 		if ( count( $urls ) > self::MAX_IMPORT_URLS ) {
 			$results[] = $this->result( '', 'error', 'จำกัดการนำเข้าไม่เกิน ' . self::MAX_IMPORT_URLS . ' ลิงก์ต่อรอบ ระบบจะประมวลผลเฉพาะ ' . self::MAX_IMPORT_URLS . ' ลิงก์แรก' );
@@ -220,6 +239,7 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 	}
 
 	public function render_admin_notices(): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only state set by this plugin's post-import redirect.
 		if ( empty( $_GET['vru_fb_news_notice'] ) || 'done' !== $_GET['vru_fb_news_notice'] ) {
 			return;
 		}
@@ -232,7 +252,8 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 		$results  = get_transient( 'vru_sakaeo_fb_news_last_results_' . get_current_user_id() );
 		$logs     = $this->get_logs();
 		$missing  = $this->missing_secret_labels();
-		$tab      = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'links';
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only admin navigation state.
+		$tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'links';
 		if ( ! in_array( $tab, array( 'links', 'monthly' ), true ) ) {
 			$tab = 'links';
 		}
@@ -308,7 +329,7 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 	private function render_monthly_import_tab(): void {
 		$settings   = $this->get_settings();
 		$categories = get_categories( array( 'hide_empty' => false ) );
-		$month = isset( $_GET['facebook_month'] ) ? sanitize_text_field( wp_unslash( $_GET['facebook_month'] ) ) : current_time( 'Y-m' );
+		$month      = isset( $_GET['facebook_month'] ) ? sanitize_text_field( wp_unslash( $_GET['facebook_month'] ) ) : current_time( 'Y-m' );
 		if ( ! preg_match( '/^\d{4}-\d{2}$/', $month ) ) {
 			$month = current_time( 'Y-m' );
 		}
@@ -387,7 +408,7 @@ final class VRU_Sakaeo_Facebook_News_Importer {
 					$permalink_url = ! empty( $post['permalink_url'] ) ? esc_url_raw( (string) $post['permalink_url'] ) : '';
 					$message       = ! empty( $post['message'] ) ? wp_strip_all_tags( (string) $post['message'] ) : '';
 					$preview       = $this->trim_multibyte_text( preg_replace( '/\s+/u', ' ', $message ), 180 );
-					$image_count   = count( $this->collect_image_urls( $post ) );
+					$image_count   = count( $this->collect_image_candidates( $post ) );
 					$existing_id   = $this->find_existing_post( $post_id, $permalink_url );
 					?>
 					<tr>
@@ -509,6 +530,26 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 						</td>
 					</tr>
 					<tr>
+						<th scope="row"><label for="gallery_size">ขนาดภาพในคลังรูป</label></th>
+						<td>
+							<select id="gallery_size" name="<?php echo esc_attr( self::OPTION_SETTINGS ); ?>[gallery_size]">
+								<option value="medium_large" <?php selected( $settings['gallery_size'], 'medium_large' ); ?>>medium_large</option>
+								<option value="large" <?php selected( $settings['gallery_size'], 'large' ); ?>>large (แนะนำ)</option>
+								<option value="full" <?php selected( $settings['gallery_size'], 'full' ); ?>>full</option>
+							</select>
+							<p class="description">ค่าเริ่มต้น large ให้ภาพชัดขึ้นและยังใช้ responsive srcset ของ WordPress</p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row">Featured Image ในคลังรูป</th>
+						<td>
+							<label>
+								<input name="<?php echo esc_attr( self::OPTION_SETTINGS ); ?>[include_featured_in_gallery]" type="checkbox" value="1" <?php checked( $settings['include_featured_in_gallery'], 1 ); ?> />
+								แสดง Featured Image ซ้ำในคลังรูป (ค่าเริ่มต้นปิด)
+							</label>
+						</td>
+					</tr>
+					<tr>
 						<th scope="row">ลิงก์ต้นทางท้ายข่าว</th>
 						<td>
 							<label>
@@ -522,6 +563,261 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 			</form>
 		</div>
 		<?php
+	}
+
+	public function render_repair_page(): void {
+		if ( ! current_user_can( self::CAPABILITY ) ) {
+			wp_die( esc_html__( 'You do not have permission to repair news images.', 'vru-sakaeo-fb-news' ) );
+		}
+
+		$rows  = $this->scan_existing_news_images();
+		$nonce = wp_create_nonce( self::REPAIR_NONCE_ACTION );
+		?>
+		<div class="wrap">
+			<h1>ซ่อมรูปข่าวเดิม</h1>
+			<div class="notice notice-info inline"><p>ระบบจะดึงรูปจาก Facebook ใหม่ สร้าง revision และแก้เฉพาะ Featured Image กับ gallery ของปลั๊กอิน โดยไม่ลบไฟล์สื่อเก่าและไม่เปลี่ยนหัวข้อ หมวดหมู่ สถานะ วันที่ หรือข้อความข่าว</p></div>
+			<p>
+				<button type="button" class="button button-primary" id="vru-fb-repair-selected">ซ่อมข่าวที่เลือก</button>
+				<button type="button" class="button" id="vru-fb-repair-cancel" hidden>ยกเลิกหลังรายการนี้</button>
+				<span class="spinner" id="vru-fb-repair-spinner"></span>
+			</p>
+			<p id="vru-fb-repair-progress" aria-live="polite"></p>
+			<table class="widefat striped">
+				<thead><tr><td class="check-column"><input type="checkbox" id="vru-fb-repair-all" /></td><th>ข่าว</th><th>Facebook Post ID</th><th>ภาพเดิม</th><th>ภาพไม่ซ้ำที่พบ</th><th>ผลสแกน</th></tr></thead>
+				<tbody>
+				<?php if ( empty( $rows ) ) : ?>
+					<tr><td colspan="6">ยังไม่มีข่าวที่นำเข้าจาก Facebook</td></tr>
+				<?php endif; ?>
+				<?php foreach ( $rows as $row ) : ?>
+					<tr data-post-id="<?php echo esc_attr( $row['post_id'] ); ?>">
+						<th scope="row" class="check-column"><input class="vru-fb-repair-check" type="checkbox" value="<?php echo esc_attr( $row['post_id'] ); ?>" /></th>
+						<td><a href="<?php echo esc_url( get_edit_post_link( $row['post_id'] ) ); ?>"><?php echo esc_html( $row['title'] ); ?></a></td>
+						<td><code><?php echo esc_html( $row['facebook_post_id'] ); ?></code></td>
+						<td><?php echo esc_html( (string) $row['attachment_count'] ); ?></td>
+						<td><?php echo esc_html( (string) $row['unique_count'] ); ?></td>
+						<td class="vru-fb-repair-status"><?php echo esc_html( $row['status_label'] ); ?></td>
+					</tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+		</div>
+		<script>
+		(function () {
+			'use strict';
+			var running = false;
+			var cancelled = false;
+			var all = document.getElementById('vru-fb-repair-all');
+			var button = document.getElementById('vru-fb-repair-selected');
+			var cancel = document.getElementById('vru-fb-repair-cancel');
+			var spinner = document.getElementById('vru-fb-repair-spinner');
+			var progress = document.getElementById('vru-fb-repair-progress');
+			if (!button) { return; }
+			if (all) {
+				all.addEventListener('change', function () {
+					document.querySelectorAll('.vru-fb-repair-check').forEach(function (item) { item.checked = all.checked; });
+				});
+			}
+			cancel.addEventListener('click', function () { cancelled = true; });
+			button.addEventListener('click', async function () {
+				if (running) { return; }
+				var selected = Array.prototype.slice.call(document.querySelectorAll('.vru-fb-repair-check:checked'));
+				if (!selected.length) { progress.textContent = 'กรุณาเลือกข่าวอย่างน้อย 1 รายการ'; return; }
+				if (!window.confirm('ยืนยันซ่อม Featured Image และ gallery ของข่าวที่เลือก? ระบบจะสร้าง revision ก่อนแก้ไข')) { return; }
+				running = true;
+				cancelled = false;
+				button.disabled = true;
+				cancel.hidden = false;
+				spinner.classList.add('is-active');
+				for (var index = 0; index < selected.length; index++) {
+					if (cancelled) { break; }
+					var input = selected[index];
+					var row = input.closest('tr');
+					var status = row.querySelector('.vru-fb-repair-status');
+					progress.textContent = 'กำลังซ่อม ' + (index + 1) + ' จาก ' + selected.length;
+					status.textContent = 'กำลังซ่อม...';
+					var body = new URLSearchParams({action: 'vru_fb_repair_post', nonce: <?php echo wp_json_encode( $nonce ); ?>, post_id: input.value});
+					try {
+						var response = await fetch(<?php echo wp_json_encode( admin_url( 'admin-ajax.php' ) ); ?>, {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'}, body: body.toString()});
+						var result = await response.json();
+						status.textContent = result && result.data && result.data.message ? result.data.message : (result.success ? 'ซ่อมสำเร็จ' : 'ซ่อมไม่สำเร็จ');
+					} catch (error) {
+						status.textContent = 'เชื่อมต่อไม่สำเร็จ กรุณาลองใหม่';
+					}
+				}
+				progress.textContent = cancelled ? 'ยกเลิกแล้วหลังจบรายการล่าสุด' : 'ดำเนินการครบแล้ว';
+				running = false;
+				button.disabled = false;
+				cancel.hidden = true;
+				spinner.classList.remove('is-active');
+			});
+		}());
+		</script>
+		<?php
+	}
+
+	public function handle_repair_ajax(): void {
+		if ( ! current_user_can( self::CAPABILITY ) ) {
+			wp_send_json_error( array( 'message' => 'คุณไม่มีสิทธิ์ซ่อมรูปข่าว' ), 403 );
+		}
+		check_ajax_referer( self::REPAIR_NONCE_ACTION, 'nonce' );
+
+		$post_id = isset( $_POST['post_id'] ) ? absint( wp_unslash( $_POST['post_id'] ) ) : 0;
+		$result  = $this->repair_existing_post_images( $post_id );
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error( array( 'message' => $this->redact_sensitive_text( $result->get_error_message() ) ), 400 );
+		}
+
+		wp_send_json_success( $result );
+	}
+
+	private function scan_existing_news_images(): array {
+		$posts = get_posts(
+			array(
+				'post_type'      => 'post',
+				'post_status'    => array( 'publish', 'draft', 'pending', 'private', 'future' ),
+				// phpcs:ignore WordPress.WP.PostsPerPage.posts_per_page_posts_per_page -- Bounded admin-only repair scan.
+				'posts_per_page' => 300,
+				'meta_key'       => '_vru_fb_post_id',
+				'orderby'        => 'modified',
+				'order'          => 'DESC',
+			)
+		);
+		$rows = array();
+		foreach ( $posts as $post ) {
+			$analysis = $this->analyze_existing_post_images( (int) $post->ID );
+			$rows[]   = array(
+				'post_id'          => (int) $post->ID,
+				'title'            => get_the_title( $post ),
+				'facebook_post_id' => sanitize_text_field( (string) get_post_meta( $post->ID, '_vru_fb_post_id', true ) ),
+				'attachment_count' => $analysis['attachment_count'],
+				'unique_count'     => $analysis['unique_count'],
+				'status_label'     => $analysis['status_label'],
+			);
+		}
+
+		return $rows;
+	}
+
+	private function analyze_existing_post_images( int $post_id ): array {
+		$attachments = get_children(
+			array(
+				'post_parent'    => $post_id,
+				'post_type'      => 'attachment',
+				'post_mime_type' => 'image',
+				'numberposts'    => -1,
+			)
+		);
+		$hashes      = array();
+		foreach ( array_map( 'absint', array_keys( $attachments ) ) as $media_id ) {
+			$hash = $this->ensure_attachment_hash( $media_id );
+			if ( $hash ) {
+				$hashes[] = $hash;
+			}
+		}
+		$unique_hashes = array_values( array_unique( $hashes ) );
+		$post          = get_post( $post_id );
+		$content       = $post ? (string) $post->post_content : '';
+		$gallery_ids   = $this->extract_gallery_media_ids( $content );
+		$featured_id   = (int) get_post_thumbnail_id( $post_id );
+		$labels        = array();
+		if ( count( $hashes ) > count( $unique_hashes ) ) {
+			$labels[] = 'ภาพซ้ำ';
+		}
+		if ( false !== strpos( $content, '"sizeSlug":"medium"' ) || false !== strpos( $content, 'size-medium' ) ) {
+			$labels[] = 'ใช้ medium';
+		}
+		if ( $featured_id && in_array( $featured_id, $gallery_ids, true ) ) {
+			$labels[] = 'Featured ซ้ำใน gallery';
+		}
+
+		return array(
+			'attachment_count' => count( $attachments ),
+			'unique_count'     => count( $unique_hashes ),
+			'status_label'     => empty( $labels ) ? 'ปกติ' : implode( ', ', $labels ),
+		);
+	}
+
+	private function repair_existing_post_images( int $post_id ) {
+		$post = get_post( $post_id );
+		if ( ! $post || 'post' !== $post->post_type ) {
+			return new WP_Error( 'vru_fb_repair_missing_post', 'ไม่พบข่าว WordPress ที่เลือก' );
+		}
+
+		$facebook_post_id = sanitize_text_field( (string) get_post_meta( $post_id, '_vru_fb_post_id', true ) );
+		if ( '' === $facebook_post_id ) {
+			return new WP_Error( 'vru_fb_repair_missing_facebook_id', 'ข่าวนี้ไม่มี Facebook Post ID' );
+		}
+
+		$facebook_post = $this->fetch_facebook_post( $facebook_post_id );
+		if ( is_wp_error( $facebook_post ) ) {
+			return $facebook_post;
+		}
+		if ( ! $this->facebook_post_matches_configured_page( $facebook_post ) ) {
+			return new WP_Error( 'vru_fb_repair_wrong_page', 'โพสต์นี้ไม่ได้มาจาก Page ID ที่อนุญาตไว้' );
+		}
+
+		$settings   = $this->get_settings();
+		$candidates = array_slice( $this->collect_image_candidates( $facebook_post ), 0, (int) $settings['max_images'] );
+		if ( empty( $candidates ) ) {
+			return new WP_Error( 'vru_fb_repair_no_images', 'ไม่พบรูปจาก Facebook จึงยังไม่แก้ข่าวเดิม' );
+		}
+
+		$this->analyze_existing_post_images( $post_id );
+		$media = $this->sideload_images( $candidates, $post_id, get_the_title( $post_id ) );
+		if ( ! empty( $media['failed'] ) || empty( $media['items'] ) ) {
+			return new WP_Error( 'vru_fb_repair_download_failed', 'ดาวน์โหลดหรือตรวจสอบรูปไม่ครบ จึงยังไม่แก้เนื้อหาข่าวเดิม กรุณาลองใหม่' );
+		}
+
+		$featured_id = (int) $media['items'][0]['media_id'];
+		$gallery     = $this->build_gallery_block( $media['items'], (string) $settings['gallery_size'], $featured_id, ! empty( $settings['include_featured_in_gallery'] ) );
+		$new_content = $this->replace_plugin_gallery( (string) $post->post_content, $gallery );
+
+		wp_save_post_revision( $post_id );
+		$updated = wp_update_post(
+			array(
+				'ID'           => $post_id,
+				'post_content' => $new_content,
+			),
+			true
+		);
+		if ( is_wp_error( $updated ) ) {
+			return new WP_Error( 'vru_fb_repair_update_failed', 'บันทึก gallery ที่ซ่อมแล้วไม่สำเร็จ' );
+		}
+
+		set_post_thumbnail( $post_id, $featured_id );
+		update_post_meta( $post_id, '_vru_fb_managed_version', '2.2.1' );
+
+		$unique_count  = count( $media['items'] );
+		$gallery_count = ! empty( $settings['include_featured_in_gallery'] ) ? $unique_count : max( 0, $unique_count - 1 );
+		return array( 'message' => 'ซ่อมสำเร็จ: ภาพไม่ซ้ำ ' . $unique_count . ' ภาพ, gallery ' . $gallery_count . ' ภาพ' );
+	}
+
+	private function extract_gallery_media_ids( string $content ): array {
+		$ids = array();
+		if ( preg_match_all( '/<!-- wp:gallery\b.*?<!-- \/wp:gallery -->/s', $content, $galleries ) ) {
+			foreach ( $galleries[0] as $gallery ) {
+				if ( preg_match_all( '/"id"\s*:\s*(\d+)/', $gallery, $matches ) ) {
+					$ids = array_merge( $ids, array_map( 'absint', $matches[1] ) );
+				}
+			}
+		}
+
+		return array_values( array_unique( array_filter( $ids ) ) );
+	}
+
+	private function replace_plugin_gallery( string $content, string $gallery ): string {
+		$replacement = '' !== $gallery ? "\n" . $gallery : '';
+		$marked      = '/\s*<!-- vru-fb-gallery:start -->.*?<!-- vru-fb-gallery:end -->\s*/s';
+		if ( preg_match( $marked, $content ) ) {
+			return trim( (string) preg_replace( $marked, $replacement, $content, 1 ) );
+		}
+
+		$legacy = '/\s*<!-- wp:gallery\b.*?<!-- \/wp:gallery -->\s*$/s';
+		if ( preg_match( $legacy, $content ) ) {
+			return trim( (string) preg_replace( $legacy, $replacement, $content, 1 ) );
+		}
+
+		return trim( $content . $replacement );
 	}
 
 	private function has_page_access_token(): bool {
@@ -569,7 +865,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 			$endpoint
 		);
 
-		$body = $this->fetch_facebook_json_object_with_token( $url, $source_token );
+		$body         = $this->fetch_facebook_json_object_with_token( $url, $source_token );
 		$direct_error = is_wp_error( $body ) ? $body : null;
 
 		if ( is_array( $body ) && ! empty( $body['access_token'] ) && is_scalar( $body['access_token'] ) ) {
@@ -637,6 +933,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 	}
 
 	private function render_token_diagnostics(): void {
+
 		if ( ! $this->has_page_access_token() || '' === $this->get_required_page_id() || '' === $this->get_app_secret() ) {
 			echo '<p class="description">ตั้งค่า Page ID, access token และ App Secret ให้ครบ เพื่อทดสอบการเชื่อมต่อกับเพจ</p>';
 			return;
@@ -742,7 +1039,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 	}
 
 	private function import_from_url( string $url, int $category_id = 0 ): array {
-		$url      = esc_url_raw( trim( $url ) );
+		$url = esc_url_raw( trim( $url ) );
 
 		$missing = $this->missing_secret_labels();
 		if ( ! empty( $missing ) ) {
@@ -800,7 +1097,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 	}
 
 	private function import_facebook_post( array $facebook_post, string $source_url = '', int $category_id = 0 ): array {
-		$settings = $this->get_settings();
+		$settings         = $this->get_settings();
 		$post_category_id = $this->resolve_category_id( $category_id, (int) $settings['category_id'] );
 
 		if ( ! $this->facebook_post_matches_configured_page( $facebook_post ) ) {
@@ -829,7 +1126,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 
 		$message    = ! empty( $facebook_post['message'] ) ? wp_strip_all_tags( (string) $facebook_post['message'] ) : '';
 		$title      = $this->build_title( $message, $facebook_post );
-		$image_urls = array_slice( $this->collect_image_urls( $facebook_post ), 0, (int) $settings['max_images'] );
+		$candidates = array_slice( $this->collect_image_candidates( $facebook_post ), 0, (int) $settings['max_images'] );
 		$content    = $this->build_content( $message, $permalink, (bool) $settings['show_source'] );
 
 		$new_post_id = wp_insert_post(
@@ -841,9 +1138,10 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 				'post_category' => array_filter( array( $post_category_id ) ),
 				'post_date'     => $this->facebook_date_for_wordpress( $facebook_post ),
 				'meta_input'    => array(
-					'_vru_fb_post_id'     => $facebook_post_id,
-					'_vru_fb_permalink'   => $permalink,
-					'_vru_fb_imported_at' => current_time( 'mysql' ),
+					'_vru_fb_post_id'         => $facebook_post_id,
+					'_vru_fb_permalink'       => $permalink,
+					'_vru_fb_imported_at'     => current_time( 'mysql' ),
+					'_vru_fb_managed_version' => '2.2.1',
 				),
 			),
 			true
@@ -853,18 +1151,28 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 			return $this->log_result( $this->result( $source_url, 'error', 'สร้างข่าวไม่สำเร็จ: ' . $new_post_id->get_error_message() ) );
 		}
 
-		$media_ids = $this->sideload_images( $image_urls, $new_post_id, $title );
-		if ( ! empty( $media_ids ) ) {
-			set_post_thumbnail( $new_post_id, $media_ids[0] );
-			$this->append_gallery_to_post( $new_post_id, $media_ids );
+		$media = $this->sideload_images( $candidates, $new_post_id, $title );
+		if ( ! empty( $media['items'] ) ) {
+			$featured_id = (int) $media['items'][0]['media_id'];
+			set_post_thumbnail( $new_post_id, $featured_id );
+			$this->append_gallery_to_post(
+				$new_post_id,
+				$media['items'],
+				(string) $settings['gallery_size'],
+				$featured_id,
+				! empty( $settings['include_featured_in_gallery'] )
+			);
 		}
 
 		$message_text = 'นำเข้าสำเร็จ';
-		if ( count( $image_urls ) < 4 ) {
+		if ( count( $candidates ) < 4 ) {
 			$message_text .= ' (พบรูปประกอบน้อยกว่า 4 รูป)';
 		}
-		if ( count( $media_ids ) < count( $image_urls ) ) {
+		if ( ! empty( $media['failed'] ) ) {
 			$message_text .= ' (บางรูปไม่ผ่านการตรวจสอบความปลอดภัยหรือดาวน์โหลดไม่สำเร็จ)';
+		}
+		if ( ! empty( $media['duplicates'] ) ) {
+			$message_text .= ' (ตัดภาพซ้ำ ' . absint( $media['duplicates'] ) . ' ภาพ)';
 		}
 
 		return $this->log_result( $this->result( $source_url ? $source_url : $permalink, 'success', $message_text, $new_post_id, $title ) );
@@ -898,9 +1206,9 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 				continue;
 			}
 
-			$source_url = ! empty( $post_map[ $selected_id ]['permalink_url'] ) ? esc_url_raw( (string) $post_map[ $selected_id ]['permalink_url'] ) : '';
+			$source_url  = ! empty( $post_map[ $selected_id ]['permalink_url'] ) ? esc_url_raw( (string) $post_map[ $selected_id ]['permalink_url'] ) : '';
 			$category_id = isset( $post_categories[ $selected_id ] ) ? absint( $post_categories[ $selected_id ] ) : 0;
-			$results[]  = $this->import_facebook_post( $post_map[ $selected_id ], $source_url, $category_id );
+			$results[]   = $this->import_facebook_post( $post_map[ $selected_id ], $source_url, $category_id );
 		}
 
 		return $results;
@@ -1335,65 +1643,201 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 	}
 
 	private function collect_image_urls( array $facebook_post ): array {
-		$urls = array();
+		return array_values(
+			array_map(
+				static function ( array $candidate ): string {
+					return (string) $candidate['url'];
+				},
+				$this->collect_image_candidates( $facebook_post )
+			)
+		);
+	}
 
-		if ( ! empty( $facebook_post['full_picture'] ) ) {
-			$urls[] = esc_url_raw( $facebook_post['full_picture'] );
-		}
+	private function collect_image_candidates( array $facebook_post ): array {
+		$candidates = array();
+		$order      = 0;
 
 		if ( ! empty( $facebook_post['attachments']['data'] ) && is_array( $facebook_post['attachments']['data'] ) ) {
-			$this->collect_attachment_images( $facebook_post['attachments']['data'], $urls );
+			$this->collect_attachment_candidates( $facebook_post['attachments']['data'], $candidates, $order );
 		}
 
-		return array_values( array_unique( array_filter( $urls ) ) );
+		if ( empty( $candidates ) && ! empty( $facebook_post['full_picture'] ) ) {
+			$url          = esc_url_raw( (string) $facebook_post['full_picture'] );
+			$post_id      = sanitize_text_field( (string) ( $facebook_post['id'] ?? '' ) );
+			$url_hash     = substr( hash( 'sha256', $this->normalize_candidate_url( $url ) ), 0, 16 );
+			$candidates[] = array(
+				'source_id' => 'full_picture:' . ( $post_id ? $post_id . ':' : '' ) . $url_hash,
+				'url'       => $url,
+				'order'     => $order,
+				'kind'      => 'full_picture',
+			);
+		}
+
+		$unique    = array();
+		$seen_ids  = array();
+		$seen_urls = array();
+		foreach ( $candidates as $candidate ) {
+			$url       = esc_url_raw( (string) ( $candidate['url'] ?? '' ) );
+			$source_id = sanitize_text_field( (string) ( $candidate['source_id'] ?? '' ) );
+			$url_key   = $this->normalize_candidate_url( $url );
+			if ( ! $this->is_allowed_image_url( $url ) ) {
+				continue;
+			}
+			if ( ( $source_id && isset( $seen_ids[ $source_id ] ) ) || ( $url_key && isset( $seen_urls[ $url_key ] ) ) ) {
+				continue;
+			}
+			if ( $source_id ) {
+				$seen_ids[ $source_id ] = true;
+			}
+			if ( $url_key ) {
+				$seen_urls[ $url_key ] = true;
+			}
+			$unique[] = array(
+				'source_id' => $source_id ? $source_id : 'url:' . hash( 'sha256', $url_key ),
+				'url'       => $url,
+				'order'     => absint( $candidate['order'] ?? count( $unique ) ),
+				'kind'      => sanitize_key( (string) ( $candidate['kind'] ?? 'attachment' ) ),
+			);
+		}
+
+		usort(
+			$unique,
+			static function ( array $left, array $right ): int {
+				return $left['order'] <=> $right['order'];
+			}
+		);
+
+		return $unique;
 	}
 
-	private function collect_attachment_images( array $attachments, array &$urls ): void {
+	private function collect_attachment_candidates( array $attachments, array &$candidates, int &$order ): void {
 		foreach ( $attachments as $attachment ) {
-			if ( ! empty( $attachment['media']['image']['src'] ) ) {
-				$urls[] = esc_url_raw( $attachment['media']['image']['src'] );
+			if ( ! empty( $attachment['subattachments']['data'] ) && is_array( $attachment['subattachments']['data'] ) ) {
+				$this->collect_attachment_candidates( $attachment['subattachments']['data'], $candidates, $order );
+				continue;
 			}
 
-			if ( ! empty( $attachment['subattachments']['data'] ) && is_array( $attachment['subattachments']['data'] ) ) {
-				$this->collect_attachment_images( $attachment['subattachments']['data'], $urls );
+			$url = ! empty( $attachment['media']['image']['src'] ) ? esc_url_raw( (string) $attachment['media']['image']['src'] ) : '';
+			if ( '' === $url ) {
+				continue;
 			}
+
+			$target_id    = isset( $attachment['target']['id'] ) ? sanitize_text_field( (string) $attachment['target']['id'] ) : '';
+			$candidates[] = array(
+				'source_id' => $target_id ? 'attachment:' . $target_id : 'url:' . hash( 'sha256', $this->normalize_candidate_url( $url ) ),
+				'url'       => $url,
+				'order'     => $order++,
+				'kind'      => 'attachment',
+			);
 		}
 	}
 
-	private function sideload_images( array $image_urls, int $post_id, string $title ): array {
-		if ( empty( $image_urls ) ) {
-			return array();
+	private function normalize_candidate_url( string $url ): string {
+		$parts = wp_parse_url( $url );
+		if ( empty( $parts['host'] ) ) {
+			return '';
+		}
+		$host = strtolower( trim( (string) $parts['host'], '.' ) );
+		$path = isset( $parts['path'] ) ? preg_replace( '#/+#', '/', rawurldecode( (string) $parts['path'] ) ) : '';
+		return $host . $path;
+	}
+
+	private function sideload_images( array $candidates, int $post_id, string $title ): array {
+		$result = array(
+			'items'      => array(),
+			'failed'     => array(),
+			'duplicates' => 0,
+		);
+		if ( empty( $candidates ) ) {
+			return $result;
 		}
 
 		require_once ABSPATH . 'wp-admin/includes/file.php';
 		require_once ABSPATH . 'wp-admin/includes/media.php';
 		require_once ABSPATH . 'wp-admin/includes/image.php';
 
-		$media_ids = array();
-		foreach ( $image_urls as $index => $image_url ) {
-			$image_url = esc_url_raw( trim( (string) $image_url ) );
+		$seen_hashes = array();
+		$seen_media  = array();
+		foreach ( $candidates as $index => $candidate ) {
+			$image_url = esc_url_raw( trim( (string) ( $candidate['url'] ?? '' ) ) );
+			$source_id = sanitize_text_field( (string) ( $candidate['source_id'] ?? '' ) );
 			if ( ! $this->is_allowed_image_url( $image_url ) ) {
+				$result['failed'][] = $source_id;
+				continue;
+			}
+
+			$existing_id = $this->find_existing_media_by_source_id( $source_id );
+			if ( $existing_id ) {
+				$hash = $this->ensure_attachment_hash( $existing_id );
+				if ( isset( $seen_media[ $existing_id ] ) || ( $hash && isset( $seen_hashes[ $hash ] ) ) ) {
+					++$result['duplicates'];
+					continue;
+				}
+				$seen_media[ $existing_id ] = true;
+				if ( $hash ) {
+					$seen_hashes[ $hash ] = true;
+				}
+				$result['items'][] = array(
+					'media_id'  => $existing_id,
+					'source_id' => $source_id,
+					'sha256'    => $hash,
+					'url'       => $image_url,
+				);
 				continue;
 			}
 
 			$head_check = $this->validate_remote_image_headers( $image_url );
 			if ( is_wp_error( $head_check ) ) {
+				$result['failed'][] = $source_id;
 				continue;
 			}
 
 			$filename  = $this->image_filename( $image_url, $post_id, $index );
 			$temp_file = $this->download_checked_image( $image_url, $filename );
 			if ( is_wp_error( $temp_file ) ) {
+				$result['failed'][] = $source_id;
+				continue;
+			}
+
+			$sha256 = hash_file( 'sha256', $temp_file );
+			if ( ! is_string( $sha256 ) || '' === $sha256 ) {
+				wp_delete_file( $temp_file );
+				$result['failed'][] = $source_id;
+				continue;
+			}
+			if ( isset( $seen_hashes[ $sha256 ] ) ) {
+				wp_delete_file( $temp_file );
+				++$result['duplicates'];
+				continue;
+			}
+
+			$existing_hash_id = $this->find_existing_media_by_hash( $sha256 );
+			if ( $existing_hash_id ) {
+				wp_delete_file( $temp_file );
+				$this->add_media_source_id( $existing_hash_id, $source_id );
+				$seen_hashes[ $sha256 ]          = true;
+				$seen_media[ $existing_hash_id ] = true;
+				$result['items'][]               = array(
+					'media_id'  => $existing_hash_id,
+					'source_id' => $source_id,
+					'sha256'    => $sha256,
+					'url'       => $image_url,
+				);
+				++$result['duplicates'];
 				continue;
 			}
 
 			$checked_file = wp_check_filetype_and_ext( $temp_file, $filename );
 			if ( empty( $checked_file['type'] ) || 0 !== strpos( $checked_file['type'], 'image/' ) ) {
 				wp_delete_file( $temp_file );
+				$result['failed'][] = $source_id;
 				continue;
 			}
+			if ( ! empty( $checked_file['proper_filename'] ) ) {
+				$filename = sanitize_file_name( (string) $checked_file['proper_filename'] );
+			}
 
-			$file     = array(
+			$file = array(
 				'name'     => $filename,
 				'type'     => $checked_file['type'],
 				'tmp_name' => $temp_file,
@@ -1404,13 +1848,89 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 			$media_id = media_handle_sideload( $file, $post_id, $title );
 			if ( is_wp_error( $media_id ) ) {
 				wp_delete_file( $temp_file );
+				$result['failed'][] = $source_id;
 				continue;
 			}
 
-			$media_ids[] = (int) $media_id;
+			$media_id = (int) $media_id;
+			$this->add_media_source_id( $media_id, $source_id );
+			update_post_meta( $media_id, '_vru_fb_media_sha256', $sha256 );
+			update_post_meta( $media_id, '_vru_fb_media_source_url', $image_url );
+			update_post_meta( $media_id, '_wp_attachment_image_alt', sanitize_text_field( $title ) );
+			$seen_hashes[ $sha256 ]  = true;
+			$seen_media[ $media_id ] = true;
+			$result['items'][]       = array(
+				'media_id'  => $media_id,
+				'source_id' => $source_id,
+				'sha256'    => $sha256,
+				'url'       => $image_url,
+			);
 		}
 
-		return $media_ids;
+		return $result;
+	}
+
+	private function find_existing_media_by_source_id( string $source_id ): int {
+		if ( '' === $source_id ) {
+			return 0;
+		}
+		$ids = get_posts(
+			array(
+				'post_type'      => 'attachment',
+				'post_status'    => 'inherit',
+				'posts_per_page' => 1,
+				'fields'         => 'ids',
+				'meta_key'       => '_vru_fb_media_source_id',
+				'meta_value'     => $source_id,
+				'no_found_rows'  => true,
+			)
+		);
+		return ! empty( $ids[0] ) ? absint( $ids[0] ) : 0;
+	}
+
+	private function find_existing_media_by_hash( string $sha256 ): int {
+		if ( '' === $sha256 ) {
+			return 0;
+		}
+		$ids = get_posts(
+			array(
+				'post_type'      => 'attachment',
+				'post_status'    => 'inherit',
+				'posts_per_page' => 1,
+				'fields'         => 'ids',
+				'meta_key'       => '_vru_fb_media_sha256',
+				'meta_value'     => $sha256,
+				'no_found_rows'  => true,
+			)
+		);
+		return ! empty( $ids[0] ) ? absint( $ids[0] ) : 0;
+	}
+
+	private function ensure_attachment_hash( int $media_id ): string {
+		$stored = sanitize_text_field( (string) get_post_meta( $media_id, '_vru_fb_media_sha256', true ) );
+		if ( preg_match( '/^[a-f0-9]{64}$/', $stored ) ) {
+			return $stored;
+		}
+		$file = get_attached_file( $media_id );
+		if ( ! is_string( $file ) || ! is_file( $file ) ) {
+			return '';
+		}
+		$hash = hash_file( 'sha256', $file );
+		if ( ! is_string( $hash ) || '' === $hash ) {
+			return '';
+		}
+		update_post_meta( $media_id, '_vru_fb_media_sha256', $hash );
+		return $hash;
+	}
+
+	private function add_media_source_id( int $media_id, string $source_id ): void {
+		if ( '' === $source_id ) {
+			return;
+		}
+		$existing = array_map( 'strval', get_post_meta( $media_id, '_vru_fb_media_source_id', false ) );
+		if ( ! in_array( $source_id, $existing, true ) ) {
+			add_post_meta( $media_id, '_vru_fb_media_source_id', $source_id, false );
+		}
 	}
 
 	private function is_allowed_image_url( string $image_url ): bool {
@@ -1528,34 +2048,77 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 		return sprintf( 'vru-sakaeo-facebook-news-%d-%02d.%s', $post_id, $index + 1, $extension );
 	}
 
-	private function append_gallery_to_post( int $post_id, array $media_ids ): void {
+	private function append_gallery_to_post( int $post_id, array $items, string $gallery_size, int $featured_id, bool $include_featured ): void {
 		$post = get_post( $post_id );
 		if ( ! $post ) {
 			return;
 		}
 
-		$gallery = "\n" . '<!-- wp:gallery {"columns":3,"linkTo":"media","sizeSlug":"medium"} -->' . "\n";
-		$gallery .= '<figure class="wp-block-gallery has-nested-images columns-3 is-cropped">' . "\n";
-
-		foreach ( $media_ids as $media_id ) {
-			$image     = wp_get_attachment_image( $media_id, 'medium' );
-			$media_url = wp_get_attachment_url( $media_id );
-			if ( $image && $media_url ) {
-				$gallery .= '<!-- wp:image {"id":' . (int) $media_id . ',"sizeSlug":"medium","linkDestination":"media"} -->' . "\n";
-				$gallery .= '<figure class="wp-block-image size-medium"><a href="' . esc_url( $media_url ) . '">' . $image . '</a></figure>' . "\n";
-				$gallery .= '<!-- /wp:image -->' . "\n";
-			}
+		$gallery = $this->build_gallery_block( $items, $gallery_size, $featured_id, $include_featured );
+		if ( '' === $gallery ) {
+			return;
 		}
-
-		$gallery .= '</figure>' . "\n";
-		$gallery .= '<!-- /wp:gallery -->';
 
 		wp_update_post(
 			array(
 				'ID'           => $post_id,
-				'post_content' => $post->post_content . $gallery,
+				'post_content' => trim( $post->post_content . "\n" . $gallery ),
 			)
 		);
+	}
+
+	private function build_gallery_block( array $items, string $gallery_size, int $featured_id, bool $include_featured ): string {
+		if ( ! in_array( $gallery_size, self::ALLOWED_GALLERY_SIZES, true ) ) {
+			$gallery_size = 'large';
+		}
+		$gallery_items = array_values(
+			array_filter(
+				$items,
+				static function ( array $item ) use ( $featured_id, $include_featured ): bool {
+					return $include_featured || absint( $item['media_id'] ?? 0 ) !== $featured_id;
+				}
+			)
+		);
+		if ( empty( $gallery_items ) ) {
+			return '';
+		}
+
+		$attributes = wp_json_encode(
+			array(
+				'columns'   => 3,
+				'linkTo'    => 'media',
+				'sizeSlug'  => $gallery_size,
+				'imageCrop' => false,
+			),
+			JSON_UNESCAPED_SLASHES
+		);
+		$gallery    = '<!-- vru-fb-gallery:start -->' . "\n";
+		$gallery   .= '<!-- wp:gallery ' . $attributes . ' -->' . "\n";
+		$gallery   .= '<figure class="wp-block-gallery has-nested-images columns-3">' . "\n";
+		foreach ( $gallery_items as $item ) {
+			$media_id  = absint( $item['media_id'] ?? 0 );
+			$image     = wp_get_attachment_image( $media_id, $gallery_size, false, array( 'loading' => 'lazy' ) );
+			$media_url = wp_get_attachment_url( $media_id );
+			if ( ! $media_id || ! $image || ! $media_url ) {
+				continue;
+			}
+			$image_attributes = wp_json_encode(
+				array(
+					'id'              => $media_id,
+					'sizeSlug'        => $gallery_size,
+					'linkDestination' => 'media',
+				),
+				JSON_UNESCAPED_SLASHES
+			);
+			$gallery         .= '<!-- wp:image ' . $image_attributes . ' -->' . "\n";
+			$gallery         .= '<figure class="wp-block-image size-' . esc_attr( $gallery_size ) . '"><a href="' . esc_url( $media_url ) . '">' . $image . '</a></figure>' . "\n";
+			$gallery         .= '<!-- /wp:image -->' . "\n";
+		}
+		$gallery .= '</figure>' . "\n";
+		$gallery .= '<!-- /wp:gallery -->' . "\n";
+		$gallery .= '<!-- vru-fb-gallery:end -->';
+
+		return $gallery;
 	}
 
 	private function facebook_date_for_wordpress( array $facebook_post ): string {
@@ -1656,7 +2219,7 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 
 	private function log_result( array $result ): array {
 		$result = $this->sanitize_log_result( $result );
-		$logs = $this->get_logs();
+		$logs   = $this->get_logs();
 		array_unshift( $logs, $result );
 		$logs = array_slice( $logs, 0, self::MAX_LOGS );
 		update_option( self::OPTION_LOGS, $logs, false );
@@ -1728,10 +2291,12 @@ define( 'VRU_FB_APP_ID', 'APP_ID_HERE' ); // optional สำหรับ token d
 
 	private function default_settings(): array {
 		return array(
-			'category_id'  => (int) get_option( 'default_category', 1 ),
-			'author_id'    => get_current_user_id() ? get_current_user_id() : 1,
-			'max_images'   => 5,
-			'show_source'  => 1,
+			'category_id'                 => (int) get_option( 'default_category', 1 ),
+			'author_id'                   => get_current_user_id() ? get_current_user_id() : 1,
+			'max_images'                  => 5,
+			'gallery_size'                => 'large',
+			'include_featured_in_gallery' => 0,
+			'show_source'                 => 1,
 		);
 	}
 }
